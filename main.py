@@ -26,6 +26,10 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+# Base URL for the Telegram Bot API. Override only for testing (e.g. a mock).
+TELEGRAM_API_BASE = os.getenv(
+    "TELEGRAM_API_BASE", "https://api.telegram.org"
+).strip().rstrip("/")
 
 RAW_KEYS = os.getenv("TWITTER_API_KEYS", "")
 API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
@@ -60,13 +64,15 @@ KEY_COOLDOWN_SECONDS = float(os.getenv("KEY_COOLDOWN_SECONDS", "900"))
 ALL_KEYS_ALERT_COOLDOWN = float(os.getenv("ALL_KEYS_ALERT_COOLDOWN", "1800"))
 UPSTREAM_BACKOFF_MAX = float(os.getenv("UPSTREAM_BACKOFF_MAX", "60"))
 
-# Promo-code extraction. Chowdeck codes (e.g. CHOW5K, OYIN5K, ABC12) mix letters
-# and digits, so that is the default requirement - it keeps ordinary English
-# words out of the claim pipeline. Set CODE_REQUIRE_MIXED=false to accept any
-# alphanumeric token >= MIN_CODE_LEN instead.
+# Promo-code extraction. Chowdeck codes can be MIXED (CHOW5K, OYIN5K) or
+# LETTERS-ONLY (e.g. MRBEEISTESTING). By default the bridge accepts BOTH: a
+# token qualifies when it mixes letters and digits, OR when it is letters-only,
+# at least MIN_CODE_LEN long and not a common English word. Set
+# CODE_REQUIRE_MIXED=true to restore the strict "must contain a digit" rule
+# (it keeps a few extra words out but will DROP letters-only codes).
 CODE_TOKEN = re.compile(r"[A-Za-z0-9]{4,20}")
 URL_OR_HANDLE = re.compile(r"(https?://\S+|www\.\S+|[#@]\w+)", re.IGNORECASE)
-CODE_REQUIRE_MIXED = os.getenv("CODE_REQUIRE_MIXED", "true").strip().lower() in (
+CODE_REQUIRE_MIXED = os.getenv("CODE_REQUIRE_MIXED", "false").strip().lower() in (
     "1", "true", "yes", "on",
 )
 # Minimum promo-code length. Keep at 5 to match the bot's X-fed minimum so
@@ -74,11 +80,40 @@ CODE_REQUIRE_MIXED = os.getenv("CODE_REQUIRE_MIXED", "true").strip().lower() in 
 MIN_CODE_LEN = int(os.getenv("MIN_CODE_LEN", "5"))
 MAX_CODES_PER_TWEET = int(os.getenv("MAX_CODES_PER_TWEET", "4"))
 
+# Stop-list of ordinary English words that must never be treated as a
+# letters-only promo code. Extend it with COMMON_WORDS (comma separated).
+_DEFAULT_COMMON_WORDS = (
+    "about above after again against almost alone along already also although "
+    "always among another answer around because before being below better "
+    "between both came change check claim code codes come could daily deals "
+    "does done down each even ever every find first found free from give going "
+    "good great have here high hold hope into just keep know last left less "
+    "life like link list look made make many might more most much must near "
+    "need never next nice none only open other over people please post promo "
+    "push right same send share should since some soon such sure take tell test "
+    "testing than that their them then there these they thing think this those "
+    "time today tweet under until very want watch well were what when where "
+    "which while will with within would your yours "
+    "checkout cart order orders vendor discount deliver delivery enjoy tasty "
+    "fresh hungry snack food meal treat chicken burger rice pizza drink eats "
+    "guys dude hello welcome thanks thank awesome amazing hurry grab rush "
+    "limited available soon check"
+)
+COMMON_WORDS = {w for w in _DEFAULT_COMMON_WORDS.split() if w}
+COMMON_WORDS.update(
+    w.strip().lower()
+    for w in os.getenv("COMMON_WORDS", "").split(",")
+    if w.strip()
+)
+
 _shutdown = asyncio.Event()
 _client = None
 
 # Shared bot state, refreshed by status_monitor() and read by poll_loop().
 _bot = {"active": True, "reachable": False}
+
+# One-time guard so a missing-credentials warning is logged only once.
+_alert_warned = False
 
 
 # ---------------------------------------------------------------------------
@@ -100,23 +135,33 @@ def extract_codes(text):
     def _is_mixed(tok):
         return any(ch.isdigit() for ch in tok) and any(ch.isalpha() for ch in tok)
 
-    if CODE_REQUIRE_MIXED:
-        chosen = [t for t in tokens if _is_mixed(t)]
-    else:
-        chosen = list(tokens)
+    def _is_code_like(tok):
+        if _is_mixed(tok):
+            return True
+        if CODE_REQUIRE_MIXED:
+            return False
+        # Tokens are upper-cased above; the stop-list is lower-case.
+        return tok.lower() not in COMMON_WORDS
+
+    chosen = [
+        t for t in tokens
+        if len(t) >= MIN_CODE_LEN and _is_code_like(t)
+    ]
 
     if not chosen:
-        # Last resort: a short tweet that is essentially just the code itself
-        # (covers a bare code tweet that has no digit).
+        # Strict-mode escape hatch: a short tweet that is essentially just the
+        # code itself (covers a bare code tweet with no digit). It is only
+        # needed when permissive letters-only matching is disabled - otherwise
+        # an empty result genuinely means "no code", so do not second-guess it.
         stripped = re.sub(r"\s+", " ", cleaned.strip())
-        if len(tokens) == 1 and 0 < len(stripped) <= 60:
+        if CODE_REQUIRE_MIXED and len(tokens) == 1 and 0 < len(stripped) <= 60:
             chosen = tokens
         else:
             return []
 
     out = []
     for tok in chosen:
-        if len(tok) >= MIN_CODE_LEN and tok not in out:
+        if tok not in out:
             out.append(tok)
     return out[:MAX_CODES_PER_TWEET]
 
@@ -143,28 +188,62 @@ def _auth_headers():
 
 
 async def alert(text):
-    """Best-effort Telegram alert to the admin. Never raises, never blocks long."""
-    if not TELEGRAM_BOT_TOKEN or not ADMIN_CHAT_ID or _client is None:
+    """Best-effort Telegram alert to the admin. Never raises, never blocks long. Every failure path is logged: missing credentials, a non-numeric chat id, a transport error, and a non-200 response from the Telegram API (whose body is printed so 401/400/403 reasons are visible instead of being swallowed). """
+    global _alert_warned
+    if not TELEGRAM_BOT_TOKEN or not ADMIN_CHAT_ID:
+        if not _alert_warned:
+            _alert_warned = True
+            missing = []
+            if not TELEGRAM_BOT_TOKEN:
+                missing.append("TELEGRAM_BOT_TOKEN")
+            if not ADMIN_CHAT_ID:
+                missing.append("ADMIN_CHAT_ID")
+            print(
+                "[bridge] WARNING: Telegram alerting is DISABLED - "
+                f"{' and '.join(missing)} not set. No admin notice will be sent.",
+                flush=True,
+            )
+        return
+    if _client is None:
         return
     try:
         chat_id = int(ADMIN_CHAT_ID)
     except (TypeError, ValueError):
         print(f"[bridge] ADMIN_CHAT_ID is not numeric ({ADMIN_CHAT_ID!r}) - alert skipped.", flush=True)
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     for attempt in range(2):
         try:
-            await _client.post(
-                url,
-                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-                timeout=10.0,
-            )
-            return
+            res = await _client.post(url, json=payload, timeout=10.0)
         except Exception as e:  # noqa: BLE001
             if attempt == 0:
                 await _sleep_or_stop(0.5)
                 continue
             print(f"[bridge] telegram alert failed: {e}", flush=True)
+            return
+        if res.status_code == 200:
+            return
+        body = (res.text or "").strip()
+        short = body[:300] + ("..." if len(body) > 300 else "")
+        if res.status_code == 400 and payload.get("parse_mode"):
+            # Markdown rejected - retry once as plain text so the alert still lands.
+            print(
+                f"[bridge] telegram alert rejected (HTTP 400): {short} "
+                "- retrying as plain text.",
+                flush=True,
+            )
+            payload = {"chat_id": chat_id, "text": text}
+            continue
+        if res.status_code >= 500 and attempt == 0:
+            await _sleep_or_stop(0.5)
+            continue
+        print(
+            f"[bridge] telegram alert rejected (HTTP {res.status_code}): {short}",
+            flush=True,
+        )
+        return
+    print("[bridge] telegram alert could not be delivered.", flush=True)
 
 
 async def _sleep_or_stop(seconds):
@@ -490,7 +569,8 @@ async def poll_loop(client, pool):
 
             codes = extract_codes(text)
             if not codes:
-                print(f"[bridge] tweet {tid}: no promo code isolated.", flush=True)
+                preview = " ".join(text.split())[:140]
+                print(f"[bridge] tweet {tid}: no promo code isolated. text={preview!r}", flush=True)
                 continue
 
             print(f"[bridge] new tweet {tid} -> {codes}", flush=True)
@@ -527,7 +607,9 @@ async def main():
         f"[bridge] active for @{TARGET_USER_NAME} | keys={len(API_KEYS)} "
         f"| secret={'set' if WEBHOOK_SECRET else 'MISSING'} "
         f"| poll={POLL_ACTIVE_SECONDS}s/{POLL_IDLE_SECONDS}s "
-        f"| status={STATUS_CHECK_SECONDS}s",
+        f"| status={STATUS_CHECK_SECONDS}s "
+        f"| alerts={'on' if (TELEGRAM_BOT_TOKEN and ADMIN_CHAT_ID) else 'OFF'} "
+        f"| codes={'mixed-only' if CODE_REQUIRE_MIXED else 'mixed+letters'}",
         flush=True,
     )
     if not WEBHOOK_SECRET:
