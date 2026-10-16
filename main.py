@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-""" Chowdeck X (Twitter) Bridge =========================== Polls GetXAPI for new promo tweets and forwards every isolated promo code to the main bot's authenticated webhook (POST /tweet). This revision fixes the pause/resume behaviour and makes key handling bulletproof ------------------------------------------------------------------------------ * PAUSE / RESUME reacts in ~1-2 seconds. The bot's /status is read by a small background monitor task, never on the detection critical path, so toggling X detection in Telegram takes effect almost instantly and detection latency is unaffected. Logs and admin notices are emitted only on a real state change (no more repeated "waiting 20s" spam). * GETXAPI KEY POOL with per-key state. A dead key goes on a cooldown, rotation is immediate (no sleep), and the admin is told which key failed, why, and which key took over - exactly like the original, but without alert flooding. * Transient upstream failures (5xx / network) never burn a key: bounded exponential backoff with jitter. * 429 is treated as a temporary throttle (cooldown), not a permanent death. * Multi-code tweets: every promo code in the tweet is forwarded, not just the first. * NEW TWEETS ONLY. A persisted high-water-mark tweet id makes the bridge announce only posts that appear AFTER it is running. The backlog that was already on the timeline is never replayed - not on restart, not after a key rotation. A burst of catch-up tweets collapses to the single latest post (MAX_NEW_PER_POLL), and a carried-forward tweet older than MAX_TWEET_AGE_SECONDS is dropped. * Everything is bounded: de-duplicated ring buffer, capped fan-out, per-request timeouts, no unbounded retry loops. A bad response never crashes the process. """
+""" Chowdeck X (Twitter) Bridge =========================== Polls GetXAPI for new promo tweets and forwards every isolated promo code to the main bot's authenticated webhook (POST /tweet). This revision fixes the pause/resume behaviour and makes key handling bulletproof ------------------------------------------------------------------------------ * PAUSE / RESUME reacts in ~1-2 seconds. The bot's /status is read by a small background monitor task, never on the detection critical path, so toggling X detection in Telegram takes effect almost instantly and detection latency is unaffected. Logs and admin notices are emitted only on a real state change (no more repeated "waiting 20s" spam). * GETXAPI KEY POOL with per-key state. A dead key goes on a cooldown, rotation is immediate (no sleep), and the admin is told which key failed, why, and which key took over - exactly like the original, but without alert flooding. * Transient upstream failures (5xx / network) never burn a key: bounded exponential backoff with jitter. * 429 is treated as a temporary throttle (cooldown), not a permanent death. * CAPS-ONLY CODES. A token is only treated as a promo code when the poster typed it in ALL CAPS with at least one letter (ENDEAVOR26, FIVEFORFIVE). Sentence-case chatter ("Slight change of plans.", "First voucher now drops at 5:50pm.") is never forwarded, so ordinary words can no longer masquerade as codes. * Multi-code tweets: every promo code in the tweet is forwarded, not just the first. * NEW TWEETS ONLY. A persisted high-water-mark tweet id makes the bridge announce only posts that appear AFTER it is running. The backlog that was already on the timeline is never replayed - not on restart, not after a key rotation. A burst of catch-up tweets collapses to the single latest post (MAX_NEW_PER_POLL), and a carried-forward tweet older than MAX_TWEET_AGE_SECONDS is dropped. * Everything is bounded: de-duplicated ring buffer, capped fan-out, per-request timeouts, no unbounded retry loops. A bad response never crashes the process. """
 
 import asyncio
 import json
@@ -77,10 +77,22 @@ URL_OR_HANDLE = re.compile(r"(https?://\S+|www\.\S+|[#@]\w+)", re.IGNORECASE)
 CODE_REQUIRE_MIXED = os.getenv("CODE_REQUIRE_MIXED", "false").strip().lower() in (
     "1", "true", "yes", "on",
 )
+CODE_REQUIRE_CAPS = os.getenv("CODE_REQUIRE_CAPS", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 # Minimum promo-code length. Keep at 5 to match the bot's X-fed minimum so
 # nothing the bot accepts is silently dropped here.
 MIN_CODE_LEN = int(os.getenv("MIN_CODE_LEN", "5"))
 MAX_CODES_PER_TWEET = int(os.getenv("MAX_CODES_PER_TWEET", "4"))
+
+# CASE GATE (default ON) - the single most effective false-positive filter.
+# Chowdeck posts real codes in ALL CAPS (ENDEAVOR26, FIVEFORFIVE) while ordinary
+# chatter is sentence-case ("Slight change of plans.", "First voucher now drops
+# at 5:50pm."). With this on, only all-upper-case tokens that contain at least
+# one letter can ever be forwarded, which removes the whole lowercase class of
+# bogus codes (PLANS / SLIGHT / DROPS). Set CODE_REQUIRE_CAPS=false only if a
+# poster ever starts writing codes in lowercase - matching is case-insensitive
+# again in that mode, and the COMMON_WORDS stop-list becomes the only filter.
 
 # ---------------------------------------------------------------------------
 # New-tweets-only policy
@@ -126,7 +138,9 @@ _DEFAULT_COMMON_WORDS = (
     "checkout cart order orders vendor discount deliver delivery enjoy tasty "
     "fresh hungry snack food meal treat chicken burger rice pizza drink eats "
     "guys dude hello welcome thanks thank awesome amazing hurry grab rush "
-    "limited available soon check"
+    "limited available soon check "
+    "plans slight drops seconds wild tomorrow tonight maybe later tonight "
+    "stop start yes no true false all any more less best worst"
 )
 COMMON_WORDS = {w for w in _DEFAULT_COMMON_WORDS.split() if w}
 COMMON_WORDS.update(
@@ -149,15 +163,23 @@ _alert_warned = False
 # Helpers
 # ---------------------------------------------------------------------------
 def extract_codes(text):
-    """Return every promo-code candidate in a tweet body (deduped, ordered). Every code found in the tweet is returned, not just the first, so multi-code tweets are fully forwarded. Ordinary words are excluded unless the whole tweet is essentially just the code (short-tweet fallback). """
+    """Return every promo-code candidate in a tweet body (deduped, ordered). Every code found in the tweet is returned, not just the first, so multi-code tweets are fully forwarded. The tweet is tokenised WITH ITS ORIGINAL CASE intact and a token only qualifies when the poster typed it in ALL CAPS with at least one letter. Uppercasing the tweet first (the old behaviour) turned sentence-case chatter such as "Slight change of plans." into the bogus codes SLIGHT / PLANS, so case is preserved and checked explicitly instead. """
     if not text:
         return []
 
     cleaned = URL_OR_HANDLE.sub(" ", text)
     tokens = []
-    for t in CODE_TOKEN.findall(cleaned.upper()):
+    for t in CODE_TOKEN.findall(cleaned):  # case preserved on purpose
         if t not in tokens:
             tokens.append(t)
+
+    # CASE GATE: all-caps token carrying at least one letter. Pure-digit tokens
+    # ("48", "550") are never codes and are dropped here as well.
+    if CODE_REQUIRE_CAPS:
+        tokens = [
+            t for t in tokens
+            if any(ch.isalpha() for ch in t) and t == t.upper()
+        ]
     if not tokens:
         return []
 
@@ -169,7 +191,9 @@ def extract_codes(text):
             return True
         if CODE_REQUIRE_MIXED:
             return False
-        # Tokens are upper-cased above; the stop-list is lower-case.
+        # Letters-only token: reject ordinary English words. Tokens keep their
+        # original case here, so compare against the lower-case stop-list
+        # case-insensitively.
         return tok.lower() not in COMMON_WORDS
 
     chosen = [
@@ -812,6 +836,8 @@ async def main():
         f"| status={STATUS_CHECK_SECONDS}s "
         f"| alerts={'on' if (TELEGRAM_BOT_TOKEN and ADMIN_CHAT_ID) else 'OFF'} "
         f"| codes={'mixed-only' if CODE_REQUIRE_MIXED else 'mixed+letters'} "
+        f"| caps={'on' if CODE_REQUIRE_CAPS else 'off'} "
+        f"| stoplist={len(COMMON_WORDS)} "
         f"| new=latest-only(max {MAX_NEW_PER_POLL}/poll, "
         f"age<={MAX_TWEET_AGE_SECONDS:.0f}s) "
         f"| state={STATE_FILE if (PERSIST_HWM and STATE_FILE) else 'memory-only'}",
