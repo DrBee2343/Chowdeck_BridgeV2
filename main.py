@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-""" Chowdeck X (Twitter) Bridge =========================== Polls GetXAPI for new promo tweets and forwards every isolated promo code to the main bot's authenticated webhook (POST /tweet). This revision fixes the pause/resume behaviour and makes key handling bulletproof ------------------------------------------------------------------------------ * PAUSE / RESUME reacts in ~1-2 seconds. The bot's /status is read by a small background monitor task, never on the detection critical path, so toggling X detection in Telegram takes effect almost instantly and detection latency is unaffected. Logs and admin notices are emitted only on a real state change (no more repeated "waiting 20s" spam). * GETXAPI KEY POOL with per-key state. A dead key goes on a cooldown, rotation is immediate (no sleep), and the admin is told which key failed, why, and which key took over - exactly like the original, but without alert flooding. * Transient upstream failures (5xx / network) never burn a key: bounded exponential backoff with jitter. * 429 is treated as a temporary throttle (cooldown), not a permanent death. * Multi-code tweets: every promo code in the tweet is forwarded, not just the first. * Everything is bounded: de-duplicated ring buffer, capped fan-out, per-request timeouts, no unbounded retry loops. A bad response never crashes the process. """
+""" Chowdeck X (Twitter) Bridge =========================== Polls GetXAPI for new promo tweets and forwards every isolated promo code to the main bot's authenticated webhook (POST /tweet). This revision fixes the pause/resume behaviour and makes key handling bulletproof ------------------------------------------------------------------------------ * PAUSE / RESUME reacts in ~1-2 seconds. The bot's /status is read by a small background monitor task, never on the detection critical path, so toggling X detection in Telegram takes effect almost instantly and detection latency is unaffected. Logs and admin notices are emitted only on a real state change (no more repeated "waiting 20s" spam). * GETXAPI KEY POOL with per-key state. A dead key goes on a cooldown, rotation is immediate (no sleep), and the admin is told which key failed, why, and which key took over - exactly like the original, but without alert flooding. * Transient upstream failures (5xx / network) never burn a key: bounded exponential backoff with jitter. * 429 is treated as a temporary throttle (cooldown), not a permanent death. * Multi-code tweets: every promo code in the tweet is forwarded, not just the first. * NEW TWEETS ONLY. A persisted high-water-mark tweet id makes the bridge announce only posts that appear AFTER it is running. The backlog that was already on the timeline is never replayed - not on restart, not after a key rotation. A burst of catch-up tweets collapses to the single latest post (MAX_NEW_PER_POLL), and a carried-forward tweet older than MAX_TWEET_AGE_SECONDS is dropped. * Everything is bounded: de-duplicated ring buffer, capped fan-out, per-request timeouts, no unbounded retry loops. A bad response never crashes the process. """
 
 import asyncio
+import json
 import os
 import random
 import re
 import signal
 import time
 from collections import deque
+from datetime import datetime, timezone
 
 import httpx
 
@@ -79,6 +81,33 @@ CODE_REQUIRE_MIXED = os.getenv("CODE_REQUIRE_MIXED", "false").strip().lower() in
 # nothing the bot accepts is silently dropped here.
 MIN_CODE_LEN = int(os.getenv("MIN_CODE_LEN", "5"))
 MAX_CODES_PER_TWEET = int(os.getenv("MAX_CODES_PER_TWEET", "4"))
+
+# ---------------------------------------------------------------------------
+# New-tweets-only policy
+# ---------------------------------------------------------------------------
+# The bridge must never replay old tweets. It keeps a HIGH-WATER MARK: the
+# numeric id of the newest tweet it has ever observed. Each poll forwards only
+# tweets whose id is STRICTLY GREATER than that mark - the backlog that was
+# already on the timeline when the bridge (re)started is therefore never
+# announced, even after a restart or a key rotation.
+#
+# At most MAX_NEW_PER_POLL tweets are forwarded per poll, newest first, so a
+# sudden burst of catch-up tweets collapses to the single latest post.
+MAX_NEW_PER_POLL = max(1, int(os.getenv("MAX_NEW_PER_POLL", "1")))
+# Reject a carried-forward tweet whose timestamp is older than this many
+# seconds. Guards against an upstream/query hiccup surfacing a stale tweet as
+# if it were fresh. Set to 0 to disable the age gate.
+MAX_TWEET_AGE_SECONDS = float(os.getenv("MAX_TWEET_AGE_SECONDS", "180"))
+# Where the high-water mark is persisted. On Railway, point this at a mounted
+# volume (e.g. /data/bridge_state.json) so it survives redeploys. When the
+# path is not writable the mark is still kept in memory for this process.
+_default_state_path = (
+    "/data/bridge_state.json" if os.path.isdir("/data") else "bridge_state.json"
+)
+STATE_FILE = os.getenv("STATE_FILE", _default_state_path).strip()
+PERSIST_HWM = os.getenv("PERSIST_HWM", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 # Stop-list of ordinary English words that must never be treated as a
 # letters-only promo code. Extend it with COMMON_WORDS (comma separated).
@@ -417,6 +446,116 @@ async def status_monitor(client):
 
 
 # ---------------------------------------------------------------------------
+# Tweet identity, age and the high-water mark
+# ---------------------------------------------------------------------------
+def _tweet_id_of(tw):
+    """Return the tweet id as an int, or None when it cannot be parsed."""
+    if not isinstance(tw, dict):
+        return None
+    raw = tw.get("id")
+    if raw in (None, ""):
+        for key in ("id_str", "tweetId", "tweet_id", "rest_id"):
+            if tw.get(key) not in (None, ""):
+                raw = tw.get(key)
+                break
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+_TS_KEYS = (
+    "createdAt", "created_at", "time", "timestamp", "date",
+    "tweetedAt", "tweetCreatedAt", "created",
+)
+
+
+def _parse_tweet_time(value):
+    """Parse an epoch (seconds or milliseconds) or ISO-8601 stamp to epoch seconds. Returns None when the format is not recognised. """
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        return ts / 1000.0 if ts > 1e11 else ts
+    text = str(value).strip()
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        ts = float(text)
+        return ts / 1000.0 if ts > 1e11 else ts
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        dt = None
+    if dt is None:
+        for fmt in ("%a %b %d %H:%M:%S %z %Y", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                dt = None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        return dt.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _tweet_age_seconds(tw, now=None):
+    """Seconds since the tweet was posted, or None when the age is unknown."""
+    stamp = None
+    for key in _TS_KEYS:
+        stamp = _parse_tweet_time(tw.get(key))
+        if stamp is not None:
+            break
+    if stamp is None:
+        return None
+    return (now if now is not None else time.time()) - stamp
+
+
+def _load_hwm():
+    """Best-effort read of the persisted high-water-mark tweet id."""
+    if not PERSIST_HWM or not STATE_FILE:
+        return None
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[bridge] state read failed ({e}) - starting without a saved high-water mark.",
+            flush=True,
+        )
+        return None
+    raw = data.get("last_tweet_id") if isinstance(data, dict) else None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _save_hwm(value):
+    """Best-effort, atomic persist of the high-water-mark tweet id."""
+    if not PERSIST_HWM or not STATE_FILE:
+        return
+    tmp = f"{STATE_FILE}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"last_tweet_id": int(value), "updated_at": time.time()}, fh)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[bridge] state write failed ({e}) - high-water mark kept in memory only.",
+            flush=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Forwarding
 # ---------------------------------------------------------------------------
 async def forward_code(client, code):
@@ -450,6 +589,16 @@ async def poll_loop(client, pool):
     baseline_done = False
     last_new = 0.0
     err_streak = 0
+
+    # Highest tweet id ever observed. Only ids STRICTLY greater than this are
+    # eligible for forwarding, so the backlog can never be replayed - not after
+    # a restart (the mark is persisted) and not after a key rotation.
+    hwm = _load_hwm()
+    if hwm is not None:
+        print(
+            f"[bridge] high-water mark loaded: tweets newer than id {hwm} count as new.",
+            flush=True,
+        )
 
     while not _shutdown.is_set():
         # Honour admin Pause instantly - no upstream calls while paused.
@@ -541,31 +690,83 @@ async def poll_loop(client, pool):
         if not isinstance(tweets, list):
             tweets = []
 
+        observed = [
+            (tid, tw)
+            for tid, tw in ((_tweet_id_of(tw), tw) for tw in tweets)
+            if tid is not None
+        ]
+
+        # ---- Baseline: lock the mark to the newest tweet, forward nothing ---
+        # Everything currently on the timeline is, by definition, old. Without a
+        # persisted mark the first usable poll locks to the newest id, so a cold
+        # start can never dump the backlog into Telegram. Nothing is added to the
+        # seen buffer here: the mark alone decides what is new, otherwise a tweet
+        # posted right after startup would be swallowed by the baseline.
         if not baseline_done:
             baseline_done = True
+            newest = max((tid for tid, _ in observed), default=None)
+            if hwm is None and newest is not None:
+                hwm = newest
+                _save_hwm(hwm)
+                print(
+                    f"[bridge] no saved high-water mark - locked to newest tweet id "
+                    f"{hwm}; existing tweets never forwarded.",
+                    flush=True,
+                )
+            print(
+                f"[bridge] baseline locked: {len(observed)} tweet(s) on the timeline, "
+                f"high-water mark = {hwm}. Nothing forwarded.",
+                flush=True,
+            )
             if BASELINE_ON_START:
-                for tw in tweets:
-                    if not isinstance(tw, dict):
-                        continue
-                    tid = str(tw.get("id") or "")
-                    if tid and tid not in seen_set:
-                        seen.append(tid)
-                        seen_set.add(tid)
-                print(f"[bridge] baseline locked: {len(seen_set)} known tweet(s).", flush=True)
                 await _sleep_or_stop(POLL_ACTIVE_SECONDS)
                 continue
 
-        for tw in tweets:
-            if not isinstance(tw, dict):
-                continue
-            tid = str(tw.get("id") or "")
+        # ---- Only tweets strictly newer than the mark are candidates --------
+        fresh = [
+            (tid, tw)
+            for tid, tw in observed
+            if (hwm is None or tid > hwm) and tid not in seen_set
+        ]
+        # Newest first, so a burst collapses to the single latest post.
+        fresh.sort(key=lambda pair: pair[0], reverse=True)
+
+        # Advance the mark past everything now observed, forwarded or not, so an
+        # old (or age-rejected) tweet can never be revisited on a later poll.
+        if fresh and (hwm is None or fresh[0][0] > hwm):
+            hwm = fresh[0][0]
+            _save_hwm(hwm)
+
+        handled = 0
+        for tid, tw in fresh:
+            if handled >= MAX_NEW_PER_POLL:
+                print(
+                    f"[bridge] backlog guard: {len(fresh) - handled} older tweet(s) "
+                    f"skipped (MAX_NEW_PER_POLL={MAX_NEW_PER_POLL}) - only the latest "
+                    f"post is announced.",
+                    flush=True,
+                )
+                break
+
             text = str(tw.get("text") or "")
-            if not tid or not text or tid in seen_set:
+            if not text:
                 continue
-            if len(seen) == seen.maxlen:
-                seen_set.discard(seen.popleft())
-            seen.append(tid)
-            seen_set.add(tid)
+
+            age = _tweet_age_seconds(tw)
+            if MAX_TWEET_AGE_SECONDS > 0 and age is not None and age > MAX_TWEET_AGE_SECONDS:
+                print(
+                    f"[bridge] tweet {tid} is {age:.0f}s old "
+                    f"(gate {MAX_TWEET_AGE_SECONDS:.0f}s) - not forwarded.",
+                    flush=True,
+                )
+                continue
+
+            handled += 1
+            if tid not in seen_set:
+                if len(seen) == seen.maxlen:
+                    seen_set.discard(seen.popleft())
+                seen.append(tid)
+                seen_set.add(tid)
 
             codes = extract_codes(text)
             if not codes:
@@ -573,7 +774,8 @@ async def poll_loop(client, pool):
                 print(f"[bridge] tweet {tid}: no promo code isolated. text={preview!r}", flush=True)
                 continue
 
-            print(f"[bridge] new tweet {tid} -> {codes}", flush=True)
+            age_txt = f"{age:.0f}s" if age is not None else "unknown"
+            print(f"[bridge] new tweet {tid} (age={age_txt}) -> {codes}", flush=True)
             for code in codes:
                 await forward_code(client, code)
             last_new = time.monotonic()
@@ -609,7 +811,10 @@ async def main():
         f"| poll={POLL_ACTIVE_SECONDS}s/{POLL_IDLE_SECONDS}s "
         f"| status={STATUS_CHECK_SECONDS}s "
         f"| alerts={'on' if (TELEGRAM_BOT_TOKEN and ADMIN_CHAT_ID) else 'OFF'} "
-        f"| codes={'mixed-only' if CODE_REQUIRE_MIXED else 'mixed+letters'}",
+        f"| codes={'mixed-only' if CODE_REQUIRE_MIXED else 'mixed+letters'} "
+        f"| new=latest-only(max {MAX_NEW_PER_POLL}/poll, "
+        f"age<={MAX_TWEET_AGE_SECONDS:.0f}s) "
+        f"| state={STATE_FILE if (PERSIST_HWM and STATE_FILE) else 'memory-only'}",
         flush=True,
     )
     if not WEBHOOK_SECRET:
